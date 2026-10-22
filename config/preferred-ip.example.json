@@ -1,0 +1,13 @@
+{
+  "proxySettings": {
+    "enableWsReverseProxy": true,
+    "wsReverseProxyUrl": "https://upstream.example.net",
+    "nodeTlsHost": "snippet.customer.example",
+    "wsReverseProxyPath": "/tunnel?ed=2560",
+    "wsReverseProxyUseRandomUuid": false,
+    "wsReverseProxySpecificUuid": "",
+    "customNodes": "192.0.2.1:443#IPv4 示例\n[2001:db8::1]:8443#IPv6 示例\npreferred.example.net#域名示例",
+    "sublinkWorkerUrl": "",
+    "publicSubscription": false
+  }
+}

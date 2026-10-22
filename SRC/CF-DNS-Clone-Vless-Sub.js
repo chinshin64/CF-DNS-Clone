@@ -23,6 +23,93 @@ async function generateHash(content) {
     return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// A node's dial address may be a preferred IP/domain. TLS and HTTP routing must
+// still identify the user's configured Worker or active SaaS custom hostname.
+function normalizeNodeTlsHost(value) {
+    if (value === undefined || value === null || value === '') return '';
+    if (typeof value !== 'string') throw new Error('节点 TLS 主机名必须是域名。');
+    const hostname = value.trim().toLowerCase().replace(/\.$/, '');
+    if (!hostname) return '';
+    const labels = hostname.split('.');
+    if (hostname.length > 253 || labels.length < 2 || /^[\d.]+$/.test(hostname) ||
+        !labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+        throw new Error('节点 TLS 主机名请填写完整域名，不含协议、端口、路径或 IP；国际化域名请使用 Punycode。');
+    }
+    return hostname;
+}
+
+function getNodeTlsHost(proxySettings, request) {
+    const explicitHost = normalizeNodeTlsHost(proxySettings.nodeTlsHost);
+    if (explicitHost) return explicitHost;
+    if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
+        try {
+            return new URL(_du(proxySettings.wsReverseProxyUrl)).hostname;
+        } catch (e) { /* Preserve the request-host fallback for legacy settings. */ }
+    }
+    return new URL(request.url).hostname;
+}
+
+// Shared by custom nodes, collected IP files, and normalized external sources.
+// IPv6 with a port uses [address]:port; bare IPv6 always uses the default port.
+function parsePreferredNode(line, allowCustomPath = true) {
+    if (typeof line !== 'string') return null;
+    line = line.trim();
+    if (!line || line.startsWith('#') || line.startsWith('//')) return null;
+    const pathIndex = allowCustomPath ? line.indexOf('@') : -1;
+    const mainPart = pathIndex < 0 ? line : line.slice(0, pathIndex);
+    const customPath = pathIndex < 0 ? null : line.slice(pathIndex + 1);
+    const hashIndex = mainPart.indexOf('#');
+    const endpoint = (hashIndex < 0 ? mainPart : mainPart.slice(0, hashIndex)).trim();
+    const remarks = hashIndex < 0 ? '' : mainPart.slice(hashIndex + 1).trim();
+    if (!endpoint || /[\s/?\\]/.test(endpoint)) return null;
+
+    let address;
+    let portText;
+    if (endpoint.startsWith('[')) {
+        const match = endpoint.match(/^\[([0-9a-f:.]+)\](?::(\d+))?$/i);
+        if (!match) return null;
+        address = `[${match[1]}]`;
+        portText = match[2];
+    } else if ((endpoint.match(/:/g) || []).length > 1) {
+        address = `[${endpoint}]`;
+    } else {
+        const match = endpoint.match(/^([^:]+)(?::(\d+))?$/);
+        if (!match) return null;
+        address = match[1].toLowerCase().replace(/\.$/, '');
+        portText = match[2];
+    }
+
+    const port = portText === undefined ? 443 : Number(portText);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    if (address.startsWith('[')) {
+        try { address = new URL(`http://${address}/`).hostname; }
+        catch (e) { return null; }
+    } else if (/^[\d.]+$/.test(address)) {
+        const octets = address.split('.');
+        if (octets.length !== 4 || !octets.every(octet => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255)) return null;
+    } else {
+        try { address = normalizeNodeTlsHost(address); }
+        catch (e) { return null; }
+        if (!address) return null;
+    }
+    return { address, port, remarks: remarks || address, customPath };
+}
+
+function buildPreferredNode(node, proxySettings, request, remarks = node.remarks) {
+    const tlsHost = getNodeTlsHost(proxySettings, request);
+    const uuid = proxySettings.wsReverseProxyUseRandomUuid
+        ? crypto.randomUUID() : proxySettings.wsReverseProxySpecificUuid;
+    const path = node.customPath
+        ? `/${node.customPath.replace(/^\//, '')}` : (proxySettings.wsReverseProxyPath || '/');
+    const parameters = {
+        encryption: 'none', security: 'tls', sni: tlsHost, fp: 'random',
+        type: 'ws', host: tlsHost, path,
+    };
+    const query = Object.entries(parameters)
+        .map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&');
+    return `${_k(['vle','ss'])}://${uuid}@${node.address}:${node.port}?${query}#${encodeURIComponent(remarks)}`;
+}
+
 export default {
   async fetch(request, env, ctx) {
       const upgradeHeader = request.headers.get("Upgrade");
@@ -242,18 +329,6 @@ async function generateIpSourceNodes(ipSources, githubSettings, proxySettings, r
         return [];
     }
 
-    const requestHostname = new URL(request.url).hostname;
-    let sniHost = requestHostname;
-    if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
-        try {
-            sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
-        } catch (e) {}
-    }
-
-    const globalPath = proxySettings.wsReverseProxyPath || '/';
-    const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-    const specificUuid = proxySettings.wsReverseProxySpecificUuid;
-
     let allGeneratedNodes = [];
 
     for (const source of ipSources) {
@@ -261,16 +336,11 @@ async function generateIpSourceNodes(ipSources, githubSettings, proxySettings, r
             const content = await getGitHubContent(githubSettings.token, githubSettings.owner, githubSettings.repo, source.github_path);
             if (!content) continue;
 
-            const ips = content.split('\n').map(ip => ip.trim()).filter(Boolean);
+            const ips = content.split('\n').map(ip => parsePreferredNode(ip)).filter(Boolean);
             const customNames = (source.node_names || '').split('\n').map(name => name.trim()).filter(Boolean);
 
-            const nodes = ips.map((ip, index) => {
-                const remarks = customNames[index] || ip;
-                const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-                const encodedPath = encodeURIComponent(encodeURIComponent(globalPath));
-                
-                return `${_k(['vle','ss'])}://${uuid}@${ip}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
-            });
+            const nodes = ips.map((node, index) =>
+                buildPreferredNode(node, proxySettings, request, customNames[index] || node.remarks));
             allGeneratedNodes.push(...nodes);
 
         } catch (e) {
@@ -283,30 +353,13 @@ async function generateIpSourceNodes(ipSources, githubSettings, proxySettings, r
 function generateInternalNodes(domains, proxySettings, request) {
   if (!proxySettings.enableWsReverseProxy) return [];
 
-  const requestHostname = new URL(request.url).hostname;
-  let sniHost = requestHostname;
-  
-  if (proxySettings.useProxyUrlForSni) {
-      const effectiveWsReverseProxyUrl = proxySettings.wsReverseProxyUrl || 'https://snippets.neib.cn';
-      try {
-          sniHost = new URL(effectiveWsReverseProxyUrl).hostname;
-      } catch (e) {
-          console.warn("Invalid or missing wsReverseProxyUrl, falling back to request hostname for SNI/Host", e.message);
-          sniHost = requestHostname;
-      }
-  }
-  
-  const path = proxySettings.wsReverseProxyPath || '/';
-  const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-  const specificUuid = proxySettings.wsReverseProxySpecificUuid;
-
   return domains.flatMap(domain => {
       const nodes = [];
       
       const mainNodeName = domain.notes || domain.target_domain;
-      const mainUuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-      const mainEncodedPath = encodeURIComponent(encodeURIComponent(path));
-      nodes.push(`${_k(['vle','ss'])}://${mainUuid}@${domain.target_domain}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${mainEncodedPath}#${encodeURIComponent(mainNodeName)}`);
+      const mainNode = parsePreferredNode(domain.target_domain);
+      if (!mainNode) return [];
+      nodes.push(buildPreferredNode(mainNode, proxySettings, request, mainNodeName));
 
       if (domain.is_single_resolve) {
           try {
@@ -323,10 +376,8 @@ function generateInternalNodes(domains, proxySettings, request) {
                   finalRecords.forEach((record, index) => {
                       const singleDomain = `${targetPrefix}.${index + 1}.${zone}`;
                       const nodeName = customNames[index] || (domain.notes ? `${domain.notes} #${index + 1}` : `${singleDomain}`);
-                      const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-                      const encodedPath = encodeURIComponent(encodeURIComponent(path));
-
-                      nodes.push(`${_k(['vle','ss'])}://${uuid}@${singleDomain}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(nodeName)}`);
+                      const singleNode = parsePreferredNode(singleDomain);
+                      if (singleNode) nodes.push(buildPreferredNode(singleNode, proxySettings, request, nodeName));
                   });
               }
           } catch(e) {
@@ -525,6 +576,7 @@ async function getProxySettings(db) {
         wsReverseProxyUseRandomUuid: true,
         wsReverseProxySpecificUuid: '',
         wsReverseProxyPath: '/',
+        nodeTlsHost: '',
         useSelfUrlForSni: false,
         useProxyUrlForSni: true,
         sublinkWorkerUrl: _d([104,116,116,112,115,58,47,47,110,110,109,109,46,101,117,46,111,114,103]),
@@ -720,6 +772,16 @@ async function apiSetSettings(request, env) {
   const db = env.WUYA;
   const settings = await request.json();
   const { CF_API_TOKEN, CF_ZONE_ID, proxySettings } = settings;
+  if (proxySettings !== undefined) {
+      try {
+          if (!proxySettings || typeof proxySettings !== 'object' || Array.isArray(proxySettings)) {
+              throw new Error('代理设置必须是对象。');
+          }
+          proxySettings.nodeTlsHost = normalizeNodeTlsHost(proxySettings.nodeTlsHost);
+      } catch (e) {
+          return jsonResponse({ error: e.message }, 400);
+      }
+  }
   
   if (CF_API_TOKEN && CF_ZONE_ID) {
       const seeded = await getSetting(db, 'INITIAL_DATA_SEEDED');
@@ -1525,7 +1587,12 @@ function getProxySettingsPageHTML() {
                   <div class="form-group">
                       <label for="wsReverseProxyUrl">workers 或 Snippets 地址:</label>
                       <input type="text" id="wsReverseProxyUrl" name="wsReverseProxyUrl" placeholder="例如: https://example.com">
-                      <small>您的 VLESS 节点的 ${_k(['Web','Socket'])} 流量将被转发到此地址。</small>
+                      <small>连接本 Worker 的 ${_k(['Web','Socket'])} 流量会转发到此地址；优选地址直连时使用下方的 TLS 主机名。</small>
+                  </div>
+                  <div class="form-group">
+                      <label for="nodeTlsHost">节点 TLS SNI / WebSocket Host（可选）:</label>
+                      <input type="text" id="nodeTlsHost" name="nodeTlsHost" placeholder="例如: snippet.customer.example">
+                      <small>填写已完成证书和接入验证的业务域名。节点地址仍使用克隆域名或自定义优选 IP。只填域名，不含协议、端口或路径；留空时沿用上方地址的主机名，再回退到当前订阅域名。</small>
                   </div>
                   <div class="form-group">
                       <label for="wsReverseProxyPath">Path:</label>
@@ -1575,9 +1642,9 @@ function getProxySettingsPageHTML() {
                   自定义节点
               </legend>
               <div class="form-group">
-                  <label for="customNodes">每行一个节点 (地址:端口#名称@路径)</label>
-                  <textarea id="customNodes" name="customNodes" rows="4" placeholder="1.1.1.1:10086#乌鸦@/?ed=2560\nexample.com:443#示例"></textarea>
-                  <small>@路径 部分为可选，如果留空则使用上方 ${_k(['代','理','参','数'])} 中的全局 Path。</small>
+                  <label for="customNodes">每行一个优选地址 (地址[:端口]#名称@路径)</label>
+                  <textarea id="customNodes" name="customNodes" rows="4" placeholder="192.0.2.1:443#示例@/?ed=2560\n[2001:db8::1]:8443#IPv6 示例\npreferred.example.net#域名示例"></textarea>
+                  <small>端口默认为 443；IPv6 带端口时使用方括号。#名称、@路径 均可省略，路径留空时使用全局 Path。这里只使用已有优选结果，不执行测速或修改 SaaS DNS。</small>
               </div>
           </fieldset>
 
@@ -2340,6 +2407,7 @@ window.syncSingleIpSource = (id) => {
       const ps = currentSettings.proxySettings || {};
       document.getElementById('enableWsReverseProxy').checked = ps.enableWsReverseProxy || false;
       document.getElementById('wsReverseProxyUrl').value = ps.wsReverseProxyUrl || '';
+      document.getElementById('nodeTlsHost').value = ps.nodeTlsHost || '';
       document.getElementById('wsReverseProxyPath').value = ps.wsReverseProxyPath || '/';
       document.querySelector('input[name="proxyUuidOption"][value="random"]').checked = ps.wsReverseProxyUseRandomUuid === undefined ? true : ps.wsReverseProxyUseRandomUuid;
       document.getElementById('wsReverseProxyUseSpecificUuid').checked = !ps.wsReverseProxyUseRandomUuid;
@@ -2372,6 +2440,7 @@ window.syncSingleIpSource = (id) => {
           const proxySettings = {
               enableWsReverseProxy: document.getElementById('enableWsReverseProxy').checked,
               wsReverseProxyUrl: document.getElementById('wsReverseProxyUrl').value,
+              nodeTlsHost: document.getElementById('nodeTlsHost').value,
               wsReverseProxyPath: document.getElementById('wsReverseProxyPath').value,
               wsReverseProxyUseRandomUuid: document.querySelector('input[name="proxyUuidOption"][value="random"]').checked,
               wsReverseProxySpecificUuid: document.getElementById('wsReverseProxyUuidValue').value,
@@ -3690,42 +3759,25 @@ try {
 }
 
 function processSubscriptionContent(lines) {
-const output = [];
-const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$/;
-const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-const ipv6Regex = /(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))/i;
-
-lines.forEach(line => {
-    line = line.trim();
-    if (!line) return;
-
-    let nodeInfo = null;
-
-    if (line.startsWith(_k(['vle','ss','://'])) || line.startsWith('vmess://')) {
-        nodeInfo = parseShareLink(line);
-    } else if (line.includes(':') && line.includes('#')) {
-        const parts = line.split('#');
-        if (parts.length >= 2) {
-            const addressPort = parts[0];
-            const originalRemarks = parts.slice(1).join('#');
-            const [address, portStr] = addressPort.split(':');
-            const port = parseInt(portStr, 10);
-            nodeInfo = { address, port, remarks: originalRemarks };
+    const output = [];
+    for (let line of lines) {
+        line = line.trim();
+        if (!line) continue;
+        let node;
+        if (line.startsWith(_k(['vle','ss','://'])) || line.startsWith('vmess://')) {
+            const shared = parseShareLink(line);
+            if (!shared || typeof shared.address !== 'string') continue;
+            const address = shared.address.includes(':') && !shared.address.startsWith('[')
+                ? `[${shared.address}]` : shared.address;
+            node = parsePreferredNode(`${address}:${shared.port}#${shared.remarks || address}`, false);
+        } else {
+            node = parsePreferredNode(line, false);
         }
+        if (!node) continue;
+        const remarks = formatRemarks(node.remarks, node.address);
+        output.push(`${node.address}:${node.port}#${remarks}`);
     }
-
-    if (nodeInfo) {
-        const { address, port, remarks } = nodeInfo;
-        const isValidAddress = domainRegex.test(address) || ipv4Regex.test(address) || ipv6Regex.test(address);
-        const isValidPort = !isNaN(port) && port > 0 && port < 65536;
-
-        if (isValidAddress && isValidPort) {
-            const newRemarks = formatRemarks(remarks, address);
-            output.push(`${address}:${port}#${newRemarks}`);
-        }
-    }
-});
-return output.join('\n');
+    return output.join('\n');
 }
 
 function formatRemarks(originalRemarks, address) {
@@ -3762,61 +3814,16 @@ try {
 }
 
 function parseExternalNodes(content, proxySettings, request) {
-const lines = content.split('\n').filter(Boolean);
-const requestHostname = new URL(request.url).hostname;
-let sniHost = requestHostname;
-if (proxySettings.useProxyUrlForSni) {
-    try {
-        sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
-    } catch (e) { }
-}
-const path = proxySettings.wsReverseProxyPath || '/';
-const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-const specificUuid = proxySettings.wsReverseProxySpecificUuid;
-
-return lines.map(line => {
-    const parts = line.split('#');
-    const addressPort = parts[0];
-    const remarks = parts.slice(1).join('#');
-    const [address, port] = addressPort.split(':');
-    
-    const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-    const encodedPath = encodeURIComponent(encodeURIComponent(path));
-    
-    return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
-});
+    // External subscriptions have already been normalized to address:port#name.
+    return parseCustomNodes(content, proxySettings, request, false);
 }
 
-function parseCustomNodes(content, proxySettings, request) {
-if (!content) return [];
-const lines = content.split('\n').filter(Boolean);
-const requestHostname = new URL(request.url).hostname;
-let sniHost = requestHostname;
-if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
-    try {
-        sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
-    } catch (e) { }
-}
-const globalPath = proxySettings.wsReverseProxyPath || '/';
-const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-const specificUuid = proxySettings.wsReverseProxySpecificUuid;
-
-return lines.map(line => {
-    const pathParts = line.split('@');
-    const mainPart = pathParts[0];
-    const customPath = pathParts.length > 1 ? pathParts[1] : null;
-
-    const remarkParts = mainPart.split('#');
-    const addressPort = remarkParts[0];
-    const remarks = remarkParts.slice(1).join('#');
-    const [address, port] = addressPort.split(':');
-    
-    const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-    const finalPath = customPath ? `/${customPath.replace(/^\//, '')}` : globalPath;
-    const encodedPath = encodeURIComponent(encodeURIComponent(finalPath));
-    
-    return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
-});
+function parseCustomNodes(content, proxySettings, request, allowCustomPath = true) {
+    if (!content) return [];
+    return content.split('\n').map(line => {
+        const node = parsePreferredNode(line, allowCustomPath);
+        return node ? buildPreferredNode(node, proxySettings, request) : null;
+    }).filter(Boolean);
 }
 
 async function syncAllIpSourcesToD1(env, log) {

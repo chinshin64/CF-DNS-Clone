@@ -1,0 +1,17 @@
+# 本地配置模板，不包含账号、凭据或线上路由。
+# 复制为 wrangler.toml 后再填写已有资源；本任务没有部署或创建资源。
+name = "cf-dns-clone-local"
+main = "SRC/CF-DNS-Clone-Vless-Sub.js"
+compatibility_date = "2026-10-22"
+workers_dev = false
+routes = []
+
+[[d1_databases]]
+binding = "WUYA"
+database_name = "cf-dns-clone-local"
+# 仅用于本地占位，线上需替换为经过确认的已有数据库 ID。
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[triggers]
+# 定时同步会写 DNS/GitHub，按实际授权另行开启。
+crons = []
